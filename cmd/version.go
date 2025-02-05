@@ -12,7 +12,7 @@ var versionCmd = &cobra.Command{
 	Short: "Print the version number of GoSNMPAgent",
 	Long:  `All software has versions. This is GoSNMPAgent`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("GoSNMPAgent version 0.1")
+		fmt.Println("GoSNMPAgent version v0.1")
 	},
 }
 

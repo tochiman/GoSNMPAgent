@@ -21,8 +21,9 @@ import (
 )
 
 type GoSNMPAgent struct {
-	conn  *net.UDPConn
-	qconn q.Connection
+	conn   *net.UDPConn
+	qconn  q.Connection
+	stream q.Stream
 
 	Listener *q.Listener
 
@@ -33,6 +34,8 @@ type GoSNMPAgent struct {
 
 	Target     string
 	TargetPort uint16
+
+	community string
 
 	quicMode bool
 	certPEM  string
@@ -79,6 +82,9 @@ var (
 // このファイルで使う構造体の初期化
 var ga = &GoSNMPAgent{}
 
+var startTime time.Time
+var TimeTicks gosnmp.Asn1BER = 0x43
+
 // runCmd represents the run command
 var runCmd = &cobra.Command{
 	Use:   "run",
@@ -88,7 +94,7 @@ var runCmd = &cobra.Command{
 		g := &gosnmp.GoSNMP{
 			Target:    ga.Target,
 			Port:      ga.TargetPort,
-			Community: "public",
+			Community: ga.community,
 			Version:   gosnmp.Version2c,
 			Timeout:   time.Duration(time.Second * 3),
 			Retries:   0,
@@ -119,11 +125,12 @@ func init() {
 	// flagの設定
 	runCmd.Flags().BoolVarP(&ga.quicMode, "quic", "q", false, "quic mode")
 	runCmd.Flags().StringVarP(&ga.Target, "target", "t", "127.0.0.1", "ipaddress of SNMPManager ")
-	runCmd.Flags().Uint16VarP(&ga.TargetPort, "target-port", "p", 1161, "port of SNMPManager ")
+	runCmd.Flags().Uint16VarP(&ga.TargetPort, "target-port", "P", 1161, "port of SNMPManager ")
 	runCmd.Flags().StringVarP(&ga.Host, "host", "H", "0.0.0.0", "SNMPAgent is hosting address")
-	runCmd.Flags().IntVarP(&ga.Port, "port", "P", 1161, "SNMPAgent is hosting port address")
-	runCmd.Flags().StringVarP(&ga.certPEM, "cert-pem", "c", "localhost/cert.pem", "Specify filepath of certPEM")
-	runCmd.Flags().StringVarP(&ga.keyPEM, "key-pem", "k", "localhost/key.pem", "Specify filepath of keyPEM")
+	runCmd.Flags().StringVarP(&ga.community, "community", "c", "public", "Specify SNMP Community")
+	runCmd.Flags().IntVarP(&ga.Port, "port", "p", 1162, "SNMPAgent is hosting port address")
+	runCmd.Flags().StringVarP(&ga.certPEM, "cert-pem", "C", "localhost/cert.pem", "Specify filepath of certPEM")
+	runCmd.Flags().StringVarP(&ga.keyPEM, "key-pem", "K", "localhost/key.pem", "Specify filepath of keyPEM")
 
 	// log 出力の設定
 	colog.SetDefaultLevel(colog.LDebug)
@@ -133,6 +140,8 @@ func init() {
 		Flag:   log.Ldate | log.Ltime | log.Lshortfile,
 	})
 	colog.Register()
+
+	startTime = time.Now()
 }
 
 func (ga *GoSNMPAgent) runAgentServer() {
@@ -146,21 +155,17 @@ func (ga *GoSNMPAgent) runAgentServer() {
 	if err != nil {
 		log.Fatalln("error:", err)
 	}
-	log.Println("info: Starting GoSNMPAgent")
+	log.Println("info: Starting SNMPAgent")
 
 	// SNMP関連の処理
 	ga.AddSnmpMib()
 	go ga.executeAgent()
-	// err = ga.Snmp.Connect()
-	// if err != nil {
-	// 	log.Println("error:", err)
-	// }
 
 	// 停止できるためにSIGINTを受け取れるようにする
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt)
 	<-quit // SIGIINTを受け取るまで待機
-	log.Println("info: Shutdown SNMP Agent")
+	log.Println("info: Shutdown SNMPAgent")
 	ga.stopAgentServer()
 
 }
@@ -179,10 +184,6 @@ func (ga *GoSNMPAgent) runAgentQUICServer() {
 	// SNMP関連の処理
 	ga.AddSnmpMib()
 	go ga.executeAgent()
-	// err = ga.Snmp.Connect()
-	// if err != nil {
-	// 	log.Println("error:", err)
-	// }
 
 	// 停止できるためにSIGINTを受け取れるようにする
 	quit := make(chan os.Signal, 1)
@@ -208,6 +209,9 @@ func generateTLSConfig(certFile string, keyFile string) *tls.Config {
 
 // Stop snmp agent
 func (ga *GoSNMPAgent) stopAgentServer() {
+	if ga.qconn != nil {
+		ga.qconn.CloseWithError(q.ApplicationErrorCode(0), "")
+	}
 	if ga.quicMode {
 		if ga.qconn != nil {
 			ga.qconn.CloseWithError(0, "Close Connection of QUIC....")
@@ -218,7 +222,6 @@ func (ga *GoSNMPAgent) stopAgentServer() {
 			return
 		}
 		ga.conn.Close()
-		// ga.Snmp.Conn.Close()
 		ga.conn = nil
 	}
 }
@@ -255,27 +258,27 @@ func cmpOid(oid1, oid2 []uint16) int {
 	return 0
 }
 
-func (a *GoSNMPAgent) AddMibList(oid string, vbType gosnmp.Asn1BER, get func(string) interface{}) {
+func (ga *GoSNMPAgent) AddMibList(oid string, vbType gosnmp.Asn1BER, get func(string) interface{}) {
 	mib := &mibEnt{
 		strOid:  oid,
 		getFunc: get,
 		objType: vbType,
 		oid:     toNumOid(oid),
 	}
-	pos := sort.Search(len(a.mibList), func(i int) bool {
-		return cmpOid(mib.oid, a.mibList[i].oid) <= 0
+	pos := sort.Search(len(ga.mibList), func(i int) bool {
+		return cmpOid(mib.oid, ga.mibList[i].oid) <= 0
 	})
-	if pos >= len(a.mibList) {
-		a.mibList = append(a.mibList, mib)
+	if pos >= len(ga.mibList) {
+		ga.mibList = append(ga.mibList, mib)
 		return
 	}
-	if cmpOid(mib.oid, a.mibList[pos].oid) == 0 {
+	if cmpOid(mib.oid, ga.mibList[pos].oid) == 0 {
 		log.Printf("AddMibList replace OID=%s", oid)
-		a.mibList[pos] = mib
+		ga.mibList[pos] = mib
 		return
 	}
-	a.mibList = append(a.mibList[:pos+1], a.mibList[pos:]...)
-	a.mibList[pos] = mib
+	ga.mibList = append(ga.mibList[:pos+1], ga.mibList[pos:]...)
+	ga.mibList[pos] = mib
 }
 
 func (ga *GoSNMPAgent) findMib(oid string, gNextReq bool) (string, gosnmp.Asn1BER, interface{}, error) {
@@ -386,7 +389,6 @@ func (ga *GoSNMPAgent) executeAgent() {
 		for {
 			// UDPデータを受信
 			n, address, err := ga.conn.ReadFromUDP(buffer)
-			log.Println(n)
 			if err != nil {
 				log.Println("error reading UDP:", err)
 				if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
@@ -441,6 +443,7 @@ func (ga *GoSNMPAgent) executeAgent() {
 				}
 				pdus = append(pdus, vb)
 			}
+			log.Println(pdus)
 			out, err := ga.Snmp.SnmpEncodeGetResponsePacket(sP.RequestID, int32(errIndex), pdus)
 			if err != nil {
 				continue
@@ -473,6 +476,7 @@ func (ga *GoSNMPAgent) AddSnmpMib() {
 	if !ga.SupportSnmpMIB {
 		return
 	}
+
 	ga.snmpCounters = make(map[string]*uint32)
 	snmpInPkts = 0
 	ga.snmpCounters[".1.3.6.1.2.1.11.1.0"] = &snmpInPkts
@@ -501,4 +505,10 @@ func (ga *GoSNMPAgent) AddSnmpMib() {
 		ga.AddMibList(fmt.Sprintf(".1.3.6.1.2.1.11.%d.0", i), gosnmp.Counter32, ga.getCounter32)
 	}
 	ga.AddMibList(".1.3.6.1.2.1.11.30.0", gosnmp.Integer, ga.getSnmpEnableAuthenTraps)
+	ga.AddMibList(".1.3.6.1.2.1.1.3.0", TimeTicks, getSysUpTime)
+
+}
+
+func getSysUpTime(oid string) interface{} {
+	return uint32((time.Now().UnixNano() - startTime.UnixNano()) / (1000 * 1000 * 10))
 }
