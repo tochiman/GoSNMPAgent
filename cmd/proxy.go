@@ -125,6 +125,8 @@ func (ga *GoSNMPAgent) executeAgentProxy() {
 		}
 		log.Printf("info: Received packet from %v", address)
 		snmpInPkts++
+
+		// パケットからSNMPデータにデコード
 		sP, err := ga.Snmp.SnmpDecodePacket(buffer[:n])
 
 		var oids []string
@@ -164,43 +166,60 @@ func (ga *GoSNMPAgent) executeAgentProxy() {
 			log.Println("error:", err)
 		}
 		defer ga.Snmp.QuicTransport.Close()
+
+		pdus := []gosnmp.SnmpPDU{}
+		var errIndex int
 		switch sP.PDUType {
 		case gosnmp.GetRequest:
+			errIndex = -1
 			res, err := ga.Snmp.Get(oids)
 			if err != nil {
 				log.Println("warning: SNMP GetRequest Error:", res)
 			}
 			for i, variable := range res.Variables {
-				fmt.Printf("%d: oid: %s ", i, variable.Name)
-
-				// the Value of each variable returned by Get() implements
-				// interface{}. You could do a type switch...
+				o, t, m, err := ga.findMib(variable.Name, bNext)
+				if err == nil {
+					variable.Name = o
+					variable.Type = t
+					variable.Value = m
+				} else if errIndex == -1 {
+					errIndex = i
+				}
+				pdus = append(pdus, variable)
+				log.Printf("%d: oid: %s ", i, variable.Name)
 				switch variable.Type {
 				case gosnmp.OctetString:
 					fmt.Printf("string: %s\n", string(variable.Value.([]byte)))
 				default:
-					// ... or often you're just interested in numeric values.
-					// ToBigInt() will return the Value as a BigInt, for plugging
-					// into your calculations.
 					fmt.Printf("number: %d\n", gosnmp.ToBigInt(variable.Value))
 				}
 			}
+		case gosnmp.GetNextRequest:
+			errIndex = -1
+			res, err := ga.Snmp.GetNext(oids)
+			if err != nil {
+				log.Println("error:", err)
+			}
+			for i, variable := range res.Variables {
+				fmt.Printf("%d: oid: %s ", i, variable.Name)
+				switch variable.Type {
+				case gosnmp.OctetString:
+					fmt.Printf("string: %s\n", string(variable.Value.([]byte)))
+				default:
+					fmt.Printf("number: %d\n", gosnmp.ToBigInt(variable.Value))
+				}
+				o, t, m, err := ga.findMib(variable.Name, bNext)
+				if err == nil {
+					variable.Name = o
+					variable.Type = t
+					variable.Value = m
+				} else if errIndex == -1 {
+					errIndex = i
+				}
+				pdus = append(pdus, variable)
+			}
 		}
 
-		// return Agent of source
-		pdus := []gosnmp.SnmpPDU{}
-		errIndex := -1
-		for i, vb := range sP.Variables {
-			o, t, m, err := ga.findMib(vb.Name, bNext)
-			if err == nil {
-				vb.Name = o
-				vb.Type = t
-				vb.Value = m
-			} else if errIndex == -1 {
-				errIndex = i
-			}
-			pdus = append(pdus, vb)
-		}
 		out, err := ga.Snmp.SnmpEncodeGetResponsePacket(sP.RequestID, int32(errIndex), pdus)
 		if err != nil {
 			continue
